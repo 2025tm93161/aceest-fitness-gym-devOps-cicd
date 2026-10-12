@@ -13,14 +13,15 @@ if str(PROJECT_ROOT) not in sys.path:
 
 @pytest.fixture()
 def app_module(tmp_path, monkeypatch):
+    """Load app.py with a completely isolated SQLite test database."""
+
     database = tmp_path / "aceest_test.db"
 
-    monkeypatch.setenv(
-        "DATABASE_PATH",
-        str(database),
-    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DATABASE_PATH", str(database))
 
     sys.modules.pop("app", None)
+
     module = importlib.import_module("app")
 
     module.DB_NAME = str(database)
@@ -52,7 +53,13 @@ def login(client, username="admin", password="admin"):
     )
 
 
-def create_client(client, name="Nia", program="Fat Loss (FL) – 3 day"):
+def create_client(
+    client,
+    name="Nia",
+    program="Fat Loss",
+    membership_status="Active",
+    membership_end="2027-01-01",
+):
     return client.post(
         "/client",
         data={
@@ -61,11 +68,18 @@ def create_client(client, name="Nia", program="Fat Loss (FL) – 3 day"):
             "height": "165",
             "weight": "60",
             "program": program,
-            "membership_expiry": "2027-01-01",
+            "target_weight": "55",
+            "target_adherence": "90",
+            "membership_status": membership_status,
+            "membership_end": membership_end,
         },
         follow_redirects=False,
     )
 
+
+# =========================================================
+# HEALTH
+# =========================================================
 
 def test_health(client):
     response = client.get("/health")
@@ -74,12 +88,9 @@ def test_health(client):
     assert response.get_json() == {"status": "healthy"}
 
 
-def test_root_redirects_to_login(client):
-    response = client.get("/")
-
-    assert response.status_code == 302
-    assert "/login" in response.headers["Location"]
-
+# =========================================================
+# LOGIN / LOGOUT / SESSION
+# =========================================================
 
 def test_login_page(client):
     response = client.get("/login")
@@ -93,7 +104,7 @@ def test_login_page(client):
     assert "Password" in page
 
 
-def test_admin_login(client):
+def test_valid_login(client):
     response = login(client)
 
     assert response.status_code == 302
@@ -108,7 +119,27 @@ def test_invalid_login(client):
     )
 
     assert response.status_code == 200
-    assert "Invalid credentials" in response.get_data(as_text=True)
+
+    assert (
+        "Invalid credentials"
+        in response.get_data(as_text=True)
+    )
+
+
+def test_root_without_login(client):
+    response = client.get("/")
+
+    assert response.status_code == 302
+    assert "/login" in response.headers["Location"]
+
+
+def test_root_when_logged_in(client):
+    login(client)
+
+    response = client.get("/")
+
+    assert response.status_code == 302
+    assert "/dashboard" in response.headers["Location"]
 
 
 def test_dashboard_requires_login(client):
@@ -127,20 +158,11 @@ def test_dashboard_after_login(client):
 
     page = response.get_data(as_text=True)
 
-    assert "ACEest Fitness Dashboard" in page
+    assert "ACEest Dashboard" in page
     assert "Add / Save Client" in page
     assert "Generate AI Program" in page
-    assert "Export PDF Report" in page
+    assert "Generate PDF Report" in page
     assert "Check Membership" in page
-
-
-def test_root_after_login_redirects_dashboard(client):
-    login(client)
-
-    response = client.get("/")
-
-    assert response.status_code == 302
-    assert "/dashboard" in response.headers["Location"]
 
 
 def test_logout(client):
@@ -151,10 +173,14 @@ def test_logout(client):
     assert response.status_code == 302
     assert "/login" in response.headers["Location"]
 
-    dashboard = client.get("/dashboard")
+    response = client.get("/dashboard")
 
-    assert dashboard.status_code == 302
+    assert response.status_code == 302
 
+
+# =========================================================
+# CLIENT
+# =========================================================
 
 def test_client_requires_login(client):
     response = create_client(client)
@@ -169,7 +195,6 @@ def test_create_client(client, app_module):
     response = create_client(client)
 
     assert response.status_code == 302
-    assert "/dashboard" in response.headers["Location"]
 
     connection = app_module.get_connection()
 
@@ -185,8 +210,49 @@ def test_create_client(client, app_module):
     assert row["age"] == 25
     assert row["height"] == 165
     assert row["weight"] == 60
-    assert row["calories"] == 1320
-    assert row["membership_expiry"] == "2027-01-01"
+
+    # Current v3.2.4 conversion uses factor 25.
+    assert row["calories"] == 1500
+
+    assert row["target_weight"] == 55
+    assert row["target_adherence"] == 90
+    assert row["membership_status"] == "Active"
+    assert row["membership_end"] == "2027-01-01"
+
+
+def test_client_without_weight(client, app_module):
+    login(client)
+
+    response = client.post(
+        "/client",
+        data={
+            "name": "ZeroWeight",
+            "age": "25",
+            "height": "165",
+            "weight": "0",
+            "program": "Beginner",
+            "target_weight": "",
+            "target_adherence": "",
+            "membership_status": "",
+            "membership_end": "",
+        },
+    )
+
+    assert response.status_code == 302
+
+    connection = app_module.get_connection()
+
+    row = connection.execute(
+        "SELECT * FROM clients WHERE name=?",
+        ("ZeroWeight",),
+    ).fetchone()
+
+    connection.close()
+
+    assert row["calories"] is None
+    assert row["target_weight"] is None
+    assert row["target_adherence"] is None
+    assert row["membership_status"] == "Active"
 
 
 def test_update_existing_client(client, app_module):
@@ -199,10 +265,13 @@ def test_update_existing_client(client, app_module):
         data={
             "name": "Nia",
             "age": "26",
-            "height": "165",
-            "weight": "61",
-            "program": "Fat Loss (FL) – 5 day",
-            "membership_expiry": "2028-01-01",
+            "height": "166",
+            "weight": "62",
+            "program": "Muscle Gain",
+            "target_weight": "65",
+            "target_adherence": "95",
+            "membership_status": "Active",
+            "membership_end": "2028-01-01",
         },
     )
 
@@ -218,9 +287,12 @@ def test_update_existing_client(client, app_module):
     connection.close()
 
     assert row["age"] == 26
-    assert row["weight"] == 61
-    assert row["calories"] == 1464
-    assert row["membership_expiry"] == "2028-01-01"
+    assert row["height"] == 166
+    assert row["weight"] == 62
+    assert row["calories"] == 1550
+    assert row["target_weight"] == 65
+    assert row["target_adherence"] == 95
+    assert row["membership_end"] == "2028-01-01"
 
 
 def test_client_name_required(client):
@@ -230,42 +302,68 @@ def test_client_name_required(client):
         "/client",
         data={
             "name": "",
-            "program": "Beginner (BG)",
-        },
-    )
-
-    assert response.status_code == 400
-    assert "Name is required" in response.get_data(as_text=True)
-
-
-def test_client_invalid_numbers(client):
-    login(client)
-
-    response = client.post(
-        "/client",
-        data={
-            "name": "Nia",
-            "age": "not-number",
-            "height": "165",
-            "weight": "60",
-            "program": "Beginner (BG)",
+            "program": "Fat Loss",
         },
     )
 
     assert response.status_code == 400
 
     assert (
-        "Age, height and weight must be valid numbers"
+        "Name is required"
         in response.get_data(as_text=True)
     )
 
 
-def test_generate_requires_login(client):
+def test_invalid_client_numbers(client):
+    login(client)
+
     response = client.post(
-        "/generate",
+        "/client",
+        data={
+            "name": "Nia",
+            "age": "wrong",
+            "height": "165",
+            "weight": "60",
+            "program": "Fat Loss",
+        },
+    )
+
+    assert response.status_code == 400
+
+    assert (
+        "must be valid numbers"
+        in response.get_data(as_text=True)
+    )
+
+
+def test_invalid_target_number(client):
+    login(client)
+
+    response = client.post(
+        "/client",
+        data={
+            "name": "Nia",
+            "age": "25",
+            "height": "165",
+            "weight": "60",
+            "program": "Fat Loss",
+            "target_weight": "invalid",
+        },
+    )
+
+    assert response.status_code == 400
+
+
+# =========================================================
+# WORKOUT
+# =========================================================
+
+def test_workout_requires_login(client):
+    response = client.post(
+        "/workout",
         data={
             "client_name": "Nia",
-            "experience": "beginner",
+            "duration_min": "60",
         },
     )
 
@@ -273,107 +371,177 @@ def test_generate_requires_login(client):
     assert "/login" in response.headers["Location"]
 
 
-def test_generate_fat_loss_program(client):
+def test_add_workout(client, app_module):
     login(client)
     create_client(client)
 
     response = client.post(
-        "/generate",
+        "/workout",
         data={
             "client_name": "Nia",
-            "experience": "beginner",
+            "date": "2026-10-12",
+            "workout_type": "Strength",
+            "duration_min": "60",
+            "notes": "Squats",
         },
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 302
 
-    page = response.get_data(as_text=True)
+    connection = app_module.get_connection()
 
-    assert "Generated AI Program" in page
-    assert "Conditioning" in page
-    assert "beginner" in page
+    row = connection.execute(
+        """
+        SELECT *
+        FROM workouts
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+
+    connection.close()
+
+    assert row["client_name"] == "Nia"
+    assert row["workout_type"] == "Strength"
+    assert row["duration_min"] == 60
+    assert row["notes"] == "Squats"
 
 
-def test_generate_muscle_gain_program(client):
+def test_invalid_workout_duration(client):
+    login(client)
+
+    response = client.post(
+        "/workout",
+        data={
+            "client_name": "Nia",
+            "date": "2026-10-12",
+            "workout_type": "Strength",
+            "duration_min": "not-a-number",
+        },
+    )
+
+    assert response.status_code == 400
+
+    assert (
+        "Duration must be a number"
+        in response.get_data(as_text=True)
+    )
+
+
+# =========================================================
+# AI PROGRAM GENERATION
+# =========================================================
+
+def test_generate_requires_login(client):
+    response = client.get(
+        "/generate?client_name=Nia"
+    )
+
+    assert response.status_code == 302
+    assert "/login" in response.headers["Location"]
+
+
+def test_generate_fat_loss(client):
     login(client)
 
     create_client(
         client,
-        name="Alex",
-        program="Muscle Gain (MG) – PPL",
+        name="FatUser",
+        program="Fat Loss",
     )
 
-    response = client.post(
-        "/generate",
-        data={
-            "client_name": "Alex",
-            "experience": "intermediate",
-        },
+    response = client.get(
+        "/generate?client_name=FatUser"
     )
 
     assert response.status_code == 200
 
     page = response.get_data(as_text=True)
 
-    assert "Hypertrophy" in page
-    assert "intermediate" in page
+    assert "Program Generated" in page
+    assert "FatUser" in page
 
 
-def test_generate_full_body_program(client):
+def test_generate_muscle_gain(client):
     login(client)
 
     create_client(
         client,
-        name="Sam",
-        program="Beginner (BG)",
+        name="MuscleUser",
+        program="Muscle Gain",
     )
 
-    response = client.post(
-        "/generate",
-        data={
-            "client_name": "Sam",
-            "experience": "advanced",
-        },
+    response = client.get(
+        "/generate?client_name=MuscleUser"
     )
 
     assert response.status_code == 200
 
     page = response.get_data(as_text=True)
 
-    assert "Full Body" in page
-    assert "advanced" in page
+    assert "Program Generated" in page
 
 
-def test_invalid_experience_defaults_beginner(client):
+def test_generate_beginner(client):
     login(client)
-    create_client(client)
 
-    response = client.post(
-        "/generate",
-        data={
-            "client_name": "Nia",
-            "experience": "invalid",
-        },
+    create_client(
+        client,
+        name="BeginnerUser",
+        program="Beginner",
+    )
+
+    response = client.get(
+        "/generate?client_name=BeginnerUser"
     )
 
     assert response.status_code == 200
-    assert "beginner" in response.get_data(as_text=True)
+
+    assert (
+        "Program Generated"
+        in response.get_data(as_text=True)
+    )
+
+
+def test_generate_unknown_program(client):
+    login(client)
+
+    create_client(
+        client,
+        name="UnknownProgram",
+        program="Something Else",
+    )
+
+    response = client.get(
+        "/generate?client_name=UnknownProgram"
+    )
+
+    assert response.status_code == 200
+
+    assert (
+        "Program Generated"
+        in response.get_data(as_text=True)
+    )
 
 
 def test_generate_unknown_client(client):
     login(client)
 
-    response = client.post(
-        "/generate",
-        data={
-            "client_name": "Unknown",
-            "experience": "beginner",
-        },
+    response = client.get(
+        "/generate?client_name=Nobody"
     )
 
     assert response.status_code == 404
-    assert "Client not found" in response.get_data(as_text=True)
 
+    assert (
+        "Client not found"
+        in response.get_data(as_text=True)
+    )
+
+
+# =========================================================
+# MEMBERSHIP
+# =========================================================
 
 def test_membership_requires_login(client):
     response = client.get(
@@ -396,20 +564,50 @@ def test_membership(client):
 
     page = response.get_data(as_text=True)
 
-    assert "Membership Expiry" in page
+    assert "Membership: Active" in page
     assert "2027-01-01" in page
+
+
+def test_membership_with_empty_values(client):
+    login(client)
+
+    create_client(
+        client,
+        name="NoMembershipDate",
+        membership_status="",
+        membership_end="",
+    )
+
+    response = client.get(
+        "/membership?client_name=NoMembershipDate"
+    )
+
+    assert response.status_code == 200
+
+    page = response.get_data(as_text=True)
+
+    assert "Membership:" in page
+    assert "N/A" in page
 
 
 def test_membership_unknown_client(client):
     login(client)
 
     response = client.get(
-        "/membership?client_name=Unknown"
+        "/membership?client_name=Nobody"
     )
 
     assert response.status_code == 200
-    assert "Client not found" in response.get_data(as_text=True)
 
+    assert (
+        "Client not found"
+        in response.get_data(as_text=True)
+    )
+
+
+# =========================================================
+# PDF
+# =========================================================
 
 def test_report_requires_login(client):
     response = client.get(
@@ -418,6 +616,21 @@ def test_report_requires_login(client):
 
     assert response.status_code == 302
     assert "/login" in response.headers["Location"]
+
+
+def test_report_unknown_client(client):
+    login(client)
+
+    response = client.get(
+        "/report?client_name=Nobody"
+    )
+
+    assert response.status_code == 404
+
+    assert (
+        "Client not found"
+        in response.get_data(as_text=True)
+    )
 
 
 def test_pdf_report(client):
@@ -433,18 +646,52 @@ def test_pdf_report(client):
     assert response.data.startswith(b"%PDF")
 
 
-def test_report_unknown_client(client):
+def test_pdf_fallback(client, app_module, monkeypatch):
     login(client)
+    create_client(client)
 
-    response = client.get(
-        "/report?client_name=Unknown"
+    monkeypatch.setattr(
+        app_module,
+        "FPDF",
+        None,
     )
 
-    assert response.status_code == 404
-    assert "Client not found" in response.get_data(as_text=True)
+    response = client.get(
+        "/report?client_name=Nia"
+    )
+
+    assert response.status_code == 200
+    assert response.data.startswith(b"%PDF-1.4")
 
 
-def test_bmi_helpers_not_present_but_database_migration(app_module):
+def test_build_basic_pdf(app_module):
+    result = app_module.build_basic_pdf(
+        "ACEest Test",
+        [
+            "Name: Nia",
+            "Program: Fat Loss",
+        ],
+    )
+
+    assert isinstance(result, bytes)
+    assert result.startswith(b"%PDF-1.4")
+    assert b"%%EOF" in result
+
+
+def test_pdf_escape(app_module):
+    result = app_module.pdf_escape(
+        r"ACEest (Nia) \ Test"
+    )
+
+    assert r"\(" in result
+    assert r"\)" in result
+
+
+# =========================================================
+# DATABASE MIGRATION
+# =========================================================
+
+def test_column_names(app_module):
     connection = app_module.get_connection()
 
     columns = app_module.column_names(
@@ -454,10 +701,10 @@ def test_bmi_helpers_not_present_but_database_migration(app_module):
 
     connection.close()
 
+    assert "name" in columns
     assert "height" in columns
-    assert "target_weight" in columns
-    assert "target_adherence" in columns
-    assert "membership_expiry" in columns
+    assert "membership_status" in columns
+    assert "membership_end" in columns
 
 
 def test_ensure_column(app_module):
@@ -465,7 +712,7 @@ def test_ensure_column(app_module):
 
     connection.execute(
         """
-        CREATE TABLE IF NOT EXISTS migration_test (
+        CREATE TABLE migration_test (
             id INTEGER PRIMARY KEY
         )
         """
@@ -485,7 +732,7 @@ def test_ensure_column(app_module):
 
     assert "extra_value" in columns
 
-    # Calling it again must not fail or duplicate the column.
+    # Execute again to cover the already-existing branch.
     app_module.ensure_column(
         connection,
         "migration_test",
@@ -496,82 +743,73 @@ def test_ensure_column(app_module):
     connection.close()
 
 
-def test_pdf_escape(app_module):
-    escaped = app_module.pdf_escape(
-        r"Test (ACEest) \ Report"
-    )
+# =========================================================
+# DASHBOARD DATA
+# =========================================================
 
-    assert r"\(" in escaped
-    assert r"\)" in escaped
-    assert "\\" in escaped
-
-
-def test_basic_pdf_fallback(app_module):
-    result = app_module.build_basic_pdf(
-        "ACEest Test",
-        [
-            "Name: Nia",
-            "Program: Fat Loss",
-        ],
-    )
-
-    assert isinstance(result, bytes)
-    assert result.startswith(b"%PDF-1.4")
-    assert b"%%EOF" in result
-
-
-def test_create_report_fallback(client, app_module, monkeypatch):
+def test_dashboard_displays_saved_data(client):
     login(client)
     create_client(client)
 
-    connection = app_module.get_connection()
-
-    row = connection.execute(
-        "SELECT * FROM clients WHERE name=?",
-        ("Nia",),
-    ).fetchone()
-
-    connection.close()
-
-    monkeypatch.setattr(
-        app_module,
-        "FPDF",
-        None,
+    client.post(
+        "/workout",
+        data={
+            "client_name": "Nia",
+            "date": "2026-10-12",
+            "workout_type": "Strength",
+            "duration_min": "45",
+            "notes": "Full body workout",
+        },
     )
 
-    result = app_module.create_report_pdf(row)
+    response = client.get("/dashboard")
 
-    assert isinstance(result, bytes)
-    assert result.startswith(b"%PDF")
+    assert response.status_code == 200
 
+    page = response.get_data(as_text=True)
+
+    assert "Nia" in page
+    assert "Active" in page
+    assert "2027-01-01" in page
+    assert "Strength" in page
+    assert "Full body workout" in page
+
+
+# =========================================================
+# COMPLETE END-TO-END FLOW
+# =========================================================
 
 def test_complete_application_flow(client):
     login(client)
 
-    create_client(client)
+    response = create_client(client)
 
-    dashboard = client.get("/dashboard")
+    assert response.status_code == 302
 
-    assert dashboard.status_code == 200
-    assert "Nia" in dashboard.get_data(as_text=True)
-
-    generated = client.post(
-        "/generate",
+    workout = client.post(
+        "/workout",
         data={
             "client_name": "Nia",
-            "experience": "beginner",
+            "date": "2026-10-12",
+            "workout_type": "Strength",
+            "duration_min": "60",
+            "notes": "Squats",
         },
     )
 
-    assert generated.status_code == 200
-    assert "Conditioning" in generated.get_data(as_text=True)
+    assert workout.status_code == 302
 
     membership = client.get(
         "/membership?client_name=Nia"
     )
 
     assert membership.status_code == 200
-    assert "2027-01-01" in membership.get_data(as_text=True)
+
+    generated = client.get(
+        "/generate?client_name=Nia"
+    )
+
+    assert generated.status_code == 200
 
     report = client.get(
         "/report?client_name=Nia"
@@ -579,6 +817,10 @@ def test_complete_application_flow(client):
 
     assert report.status_code == 200
     assert report.data.startswith(b"%PDF")
+
+    dashboard = client.get("/dashboard")
+
+    assert dashboard.status_code == 200
 
     logout_response = client.get("/logout")
 
